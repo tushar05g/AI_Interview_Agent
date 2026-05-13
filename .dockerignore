@@ -1,0 +1,54 @@
+# Version Control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+Dockerfile*
+
+# App Specific
+temp_uploads/
+*.log
+*.sqlite3
+Non_usable/
+backups/
+reports/
+api_tests/
+test_*.txt
+
+# Build & Test Artifacts
+tests/
+scripts/
+docs/
+*.md
+pytest.ini
+frontend_demo.html
+cert.pem
+key.pem
+.env
+.env.*
+!.env.example

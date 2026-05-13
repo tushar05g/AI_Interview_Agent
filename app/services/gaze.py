@@ -1,0 +1,231 @@
+import multiprocessing
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+def gaze_worker(frame_queue: multiprocessing.Queue, result_queue: multiprocessing.Queue, max_faces: int, model_path: str):
+    """
+    Processes video frames using MediaPipe FaceLandmarker.
+    Calculates eye ratios to determine gaze direction and blink state.
+    """
+    import logging
+    worker_logger = logging.getLogger("gaze_worker")
+    worker_logger.info("GazeWorker: Process Started")
+    
+    landmarker = None
+    try:
+        import os
+        import cv2
+        import numpy as np
+        import mediapipe as mp
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python import vision
+        from ..utils.image_processing import convert_to_rgb
+        
+        abs_model_path = os.path.abspath(model_path)
+        
+        # Resolve model path relative to app/assets
+        if not os.path.exists(abs_model_path):
+            curr_dir = os.path.dirname(os.path.abspath(__file__))
+            potential_paths = [
+                os.path.join(curr_dir, "..", "assets", "face_landmarker.task"),
+                os.path.join(os.getcwd(), "app", "assets", "face_landmarker.task"),
+                "/app/app/assets/face_landmarker.task", # Docker/HF common path
+                "/app/assets/face_landmarker.task" # Alternative HF path
+            ]
+            for p in potential_paths:
+                if os.path.exists(p):
+                    abs_model_path = os.path.abspath(p)
+                    worker_logger.info(f"GazeWorker: Found model at: {p}")
+                    break
+
+        if os.getenv("SPACE_ID"):
+            worker_logger.info("Cloud Environment (HF Spaces) detected. Using CPU-optimized MediaPipe settings.")
+    
+        worker_logger.info(f"GazeWorker: Initializing MediaPipe FaceLandmarker with model: {abs_model_path}")
+    
+        if not os.path.exists(abs_model_path):
+            worker_logger.error(f"GazeWorker: CRITICAL ERROR - Model file missing at {abs_model_path}. Proctoring will fail.")
+            return
+
+        base_options = python.BaseOptions(model_asset_path=abs_model_path)
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            output_face_blendshapes=True,
+            output_facial_transformation_matrixes=True,
+            num_faces=max_faces,
+            min_face_detection_confidence=0.25,
+            min_face_presence_confidence=0.25,
+            min_tracking_confidence=0.25
+        )
+        
+        try:
+            landmarker = vision.FaceLandmarker.create_from_options(options)
+            worker_logger.info("GazeWorker: MediaPipe landmarker initialized successfully.")
+        except Exception as mp_e:
+            worker_logger.error(f"GazeWorker: MediaPipe creation failed: {mp_e}")
+            return
+        
+        # State tracking for grace period
+        suspicious_start_time = None
+        SUSPICION_THRESHOLD = 3.0  # Seconds before flagging any suspicious gaze
+        
+        # Thresholds (Tuned based on user feedback)
+        H_MIN, H_MAX = 0.44, 0.56
+        V_MIN, V_MAX = 0.48, 0.62 
+        
+        while True:
+            try:
+                bgr_frame = frame_queue.get(timeout=1)
+            except multiprocessing.queues.Empty:
+                continue
+                
+            if bgr_frame is None: 
+                break
+                
+            try:
+                # Convert to RGB inside the worker using utility
+                rgb_frame = convert_to_rgb(bgr_frame)
+                rgb_frame.flags.writeable = False # Efficiency
+                
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                results = landmarker.detect(mp_image)
+                
+                final_status = "No Face" # Default
+                
+                if results.face_landmarks:
+                    num_faces = len(results.face_landmarks)
+                    
+                    if num_faces > max_faces:
+                        final_status = f"Multiple Faces ({num_faces})"
+                    else:
+                        face_landmarks = results.face_landmarks[0]
+                        h, w, _ = rgb_frame.shape
+
+                        # Helper to map normalized points to pixels
+                        def to_px(landmark):
+                            return np.array([int(landmark.x * w), int(landmark.y * h)])
+
+                        # Extract key points for eye analysis
+                        mesh = [to_px(l) for l in face_landmarks]
+                        
+                        if len(mesh) > 473:
+                            # Helper for Iris Ratio (0.0=Left, 0.5=Center, 1.0=Right)
+                            def get_iris_position(p1, p2, iris):
+                                total = np.linalg.norm(p2 - p1)
+                                if total <= 1e-6: return 0.5
+                                return np.linalg.norm(iris - p1) / total
+
+                            # -- Horizontal --
+                            r_left_h = get_iris_position(mesh[33], mesh[133], mesh[468])
+                            r_right_h = get_iris_position(mesh[362], mesh[263], mesh[473])
+                            avg_h = (r_left_h + r_right_h) / 2
+                            
+                            # -- Vertical --
+                            r_left_v = get_iris_position(mesh[159], mesh[145], mesh[468])
+                            r_right_v = get_iris_position(mesh[386], mesh[374], mesh[473])
+                            avg_v = (r_left_v + r_right_v) / 2
+                            
+                            # -- Distance-Adaptive Blink Detection --
+                            face_height = np.linalg.norm(mesh[10] - mesh[152])
+                            eye_height = np.linalg.norm(mesh[159] - mesh[145])
+                            is_blinking = eye_height < (face_height * 0.05)
+
+                            # --- DECISION LOGIC ---
+                            raw_state = "Center"
+                            
+                            if avg_h < H_MIN: raw_state = "Right"
+                            elif avg_h > H_MAX: raw_state = "Left"
+                            elif avg_v < V_MIN: raw_state = "Up"
+                            elif avg_v > V_MAX: raw_state = "Down"
+                            elif is_blinking:   raw_state = "Blink"
+                            
+                            # Process Unified Grace Period (5 Seconds)
+                            # Any state other than "Center" increments the timer
+                            if raw_state != "Center":
+                                if suspicious_start_time is None:
+                                    suspicious_start_time = time.time()
+                                
+                                elapsed = time.time() - suspicious_start_time
+                                
+                                if elapsed > SUSPICION_THRESHOLD:
+                                    # Formulate descriptive warning
+                                    msg = f"Looking {raw_state}" if raw_state != "Blink" else "Sleeping/Eyes Closed"
+                                    final_status = f"WARNING: {msg}"
+                                else:
+                                    final_status = f"Safe: Center (Brief {raw_state})"
+                                    
+                            else:
+                                final_status = "Safe: Center"
+                                suspicious_start_time = None
+                                
+                if result_queue.full():
+                    try: result_queue.get_nowait()
+                    except multiprocessing.queues.Empty: pass
+                result_queue.put(final_status)
+
+            except Exception as e:
+                worker_logger.error(f"GazeWorker Logic Error: {e}")
+
+    except Exception as e:
+        worker_logger.critical(f"GazeWorker CRITICAL FAILURE: {e}")
+        import traceback
+        worker_logger.error(traceback.format_exc())
+
+    if landmarker:
+        landmarker.close()
+
+# =============================================================================
+# BACKEND API: GazeDetector Class
+# =============================================================================
+from ..core.config import IS_ORCHESTRATOR
+
+class GazeDetector:
+    def __init__(self, model_path='app/assets/face_landmarker.task', max_faces=1):
+        logger.info("Initializing GazeDetector...")
+        self.model_path = model_path
+        
+        # --- Skip initialization in Orchestrator Mode (Render Free Tier) ---
+        if IS_ORCHESTRATOR:
+            logger.info("GazeDetector: Orchestrator Mode enabled. Worker Process DISABLED to save memory.")
+            self.worker = None
+            self.frame_queue = None
+            self.result_queue = None
+            return
+
+        self.frame_queue = multiprocessing.Queue(maxsize=1)
+        self.result_queue = multiprocessing.Queue(maxsize=1)
+        
+        logger.info(f"GazeDetector initialized with model: {model_path}")
+        self.worker = multiprocessing.Process(
+            target=gaze_worker,
+            args=(self.frame_queue, self.result_queue, max_faces, self.model_path)
+        )
+        self.worker.daemon = True
+        self.worker.start()
+        logger.info("Gaze Worker started.")
+        
+    def process_frame(self, frame_bgr):
+        if IS_ORCHESTRATOR:
+            return None
+        try:
+            # Send BGR directly; worker will convert to RGB
+            if not self.frame_queue.full():
+                self.frame_queue.put(frame_bgr)
+                
+            try:
+                return self.result_queue.get_nowait()
+            except multiprocessing.queues.Empty:
+                return None
+        except Exception as e:
+            logger.error(f"Gaze API Error: {e}")
+            return None
+            
+    def close(self):
+        try:
+            self.frame_queue.put(None)
+            self.worker.join(timeout=5)
+        except Exception as e:
+            logger.warning(f"Error closing gaze worker gracefully: {e}")
+            self.worker.terminate()
