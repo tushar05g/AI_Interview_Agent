@@ -1,6 +1,8 @@
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from sqlmodel import Field, SQLModel, Relationship, Column, ForeignKey, Integer
+from sqlalchemy import LargeBinary, Text
+from sqlalchemy.orm import deferred
 from enum import Enum
 import uuid
 import random
@@ -55,11 +57,17 @@ class User(SQLModel, table=True):
     full_name: str = Field(default="")
     password_hash: str = Field(default="")
     role: UserRole = Field(default=UserRole.CANDIDATE)
-    access_token: Optional[str] = Field(default_factory=lambda: uuid.uuid4().hex)
+    access_token: Optional[str] = Field(default_factory=lambda: uuid.uuid4().hex, index=True)
     resume_path: Optional[str] = Field(default=None)
     profile_image: Optional[str] = Field(default=None) # Path to uploaded selfie (Legacy)
-    profile_image_bytes: Optional[bytes] = Field(default=None) # Binary store for selfie
-    face_embedding: Optional[str] = Field(default=None) # JSON/CSV string of the ArcFace/Sface vector
+    profile_image_bytes: Optional[bytes] = Field(
+        default=None, 
+        sa_column=deferred(Column(LargeBinary, nullable=True))
+    ) # Binary store for selfie
+    face_embedding: Optional[str] = Field(
+        default=None,
+        sa_column=deferred(Column(Text, nullable=True))
+    ) # JSON/CSV string of the ArcFace/Sface vector
     
     # Relationships
     team_id: Optional[int] = Field(
@@ -70,6 +78,59 @@ class User(SQLModel, table=True):
         sa_relationship_kwargs={"foreign_keys": "User.team_id"}
     )
     question_papers: List["QuestionPaper"] = Relationship(back_populates="admin")
+    detail: Optional["UserDetail"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+
+class UserDetail(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(
+        sa_column=Column(Integer, ForeignKey("user.id", ondelete="CASCADE"), nullable=False, unique=True)
+    )
+
+    # Personal Info
+    date_of_birth: Optional[date] = Field(default=None)
+    gender: Optional[str] = Field(default=None, max_length=20)
+    blood_group: Optional[str] = Field(default=None, max_length=10)
+    nationality: Optional[str] = Field(default=None, max_length=60)
+    religion: Optional[str] = Field(default=None, max_length=60)
+    marital_status: Optional[str] = Field(default=None, max_length=20)  # single, married, divorced, widowed
+
+    # Family Info
+    father_name: Optional[str] = Field(default=None, max_length=100)
+    mother_name: Optional[str] = Field(default=None, max_length=100)
+    guardian_name: Optional[str] = Field(default=None, max_length=100)
+    guardian_relation: Optional[str] = Field(default=None, max_length=50)  # uncle, grandparent, etc.
+
+    # Contact Info
+    phone_number: Optional[str] = Field(default=None, max_length=20)
+    alternate_phone: Optional[str] = Field(default=None, max_length=20)
+    address_line1: Optional[str] = Field(default=None, max_length=255)
+    address_line2: Optional[str] = Field(default=None, max_length=255)
+    city: Optional[str] = Field(default=None, max_length=100)
+    state: Optional[str] = Field(default=None, max_length=100)
+    postal_code: Optional[str] = Field(default=None, max_length=20)
+    country: Optional[str] = Field(default=None, max_length=60)
+
+    # Identity Documents
+    # unique=True is intentional — these are government IDs; no two candidates should share them.
+    # PostgreSQL correctly ignores NULL values for unique constraints, so optional fields are safe.
+    aadhar_number: Optional[str] = Field(default=None, max_length=20, unique=True)   # national ID
+    pan_number: Optional[str] = Field(default=None, max_length=20, unique=True)
+    passport_number: Optional[str] = Field(default=None, max_length=30, unique=True)
+
+    # Emergency Contact
+    emergency_contact_name: Optional[str] = Field(default=None, max_length=100)
+    emergency_contact_phone: Optional[str] = Field(default=None, max_length=20)
+    emergency_contact_relation: Optional[str] = Field(default=None, max_length=50)
+
+    # Metadata
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # Relationship back to User
+    user: Optional["User"] = Relationship(back_populates="detail")
 
 
 class Team(SQLModel, table=True):

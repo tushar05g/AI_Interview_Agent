@@ -4,7 +4,6 @@ import contextlib
 import sentry_sdk
 from typing import Any
 from fastapi import FastAPI
-from fastapi.routing import APIRouter, APIRoute
 from fastapi.staticfiles import StaticFiles
 from fastapi.routing import APIRouter, APIRoute
 from fastapi.responses import JSONResponse
@@ -120,6 +119,10 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(60)
 
     import asyncio
+    main_loop = asyncio.get_running_loop()
+    from .services.status_manager import set_main_loop
+    set_main_loop(main_loop)
+
     app.state.expiry_task = asyncio.create_task(periodic_expiry_check())
     
     # RATE LIMITING: Protect AI resources
@@ -168,6 +171,14 @@ async def lifespan(app: FastAPI):
     
     logger.info("Stopping Application Resources...")
 
+    # Close all open WebRTC PeerConnections to release SRTP/ICE resources
+    try:
+        from .routers.video import close_all_peer_connections, WEBRTC_AVAILABLE
+        if WEBRTC_AVAILABLE:
+            await close_all_peer_connections()
+    except Exception as webrtc_err:
+        logger.warning(f"Lifespan: Error closing WebRTC connections: {webrtc_err}")
+
     from .core.database import engine
     if service is not None:
         service.stop()
@@ -182,20 +193,6 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Lifespan: Error closing Redis connection: {redis_close_err}")
     
     logger.info("Application Shutdown Complete.")
-
-class ExcludeNoneRoute(APIRoute):
-    """Custom route class that excludes None values from responses by default."""
-    def __init__(self, *args, **kw):
-        if "response_model_exclude_none" not in kw:
-            kw["response_model_exclude_none"] = True
-        super().__init__(*args, **kw)
-
-class ExcludeNoneRoute(APIRoute):
-    """Custom route class that excludes None values from responses by default."""
-    def __init__(self, *args, **kw):
-        if "response_model_exclude_none" not in kw:
-            kw["response_model_exclude_none"] = True
-        super().__init__(*args, **kw)
 
 app = FastAPI(
     title="AI Interview Platform API",
@@ -283,15 +280,28 @@ async def global_exception_handler(request: Request, exc: Exception):
         ).model_dump()
     )
 
+# SECURITY: Restrict origins in production, allow development origins
 from .core.config import FRONTEND_URL
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
-# SECURITY: Restrict origins in production, allow development origins
-origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+# Base origins
+origins = ["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"]
+
+# Add FRONTEND_URL from config
 if FRONTEND_URL and FRONTEND_URL not in origins:
     origins.append(FRONTEND_URL)
-if os.getenv("ENV") == "development":
-    origins = ["*"] # Keep wildcard for local dev convenience if explicitly set
+
+# Support multiple origins from environment variable
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS")
+if allowed_origins_env:
+    for origin in allowed_origins_env.split(","):
+        origin = origin.strip().rstrip("/")
+        if origin and origin not in origins:
+            origins.append(origin)
+
+# Note: allow_credentials=True requires specific origins (cannot be ["*"])
+# Even in development, we should list the origins explicitly to support cookies.
 
 app.add_middleware(
     CORSMiddleware,

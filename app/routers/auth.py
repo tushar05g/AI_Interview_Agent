@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException, status, Response
 import logging
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, select
+from sqlalchemy.orm import selectinload
+from sqlalchemy import func
 from ..core.database import get_db as get_session
 from ..models.db_models import User
 from ..auth.security import (
@@ -13,6 +15,7 @@ from ..auth.security import (
 )
 from ..schemas.auth.login import LoginRequest, TokenResponse as Token, MeResponse as UserRead
 from ..schemas.auth.registration import RegisterRequest as UserCreate
+from ..schemas.candidate.profile import CandidateSignupRequest
 from ..schemas.shared.api_response import ApiResponse
 from ..schemas.shared.user import serialize_user
 
@@ -31,20 +34,21 @@ email_service = EmailService()
 def set_auth_cookie(response: Response, token: str):
     """Sets the access_token cookie with secure flags."""
     from ..core.config import ENV
+    is_prod = ENV == "production"
     response.set_cookie(
         key="access_token",
         value=token,
         httponly=True,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         expires=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        samesite="lax",
-        secure=(ENV == "production")  # Only secure in production (HTTPS)
+        samesite="none" if is_prod else "lax",
+        secure=is_prod  # Required for samesite="none"
     )
 
 @router.post("/login", response_model=ApiResponse[dict])
 async def login(response: Response, login_data: LoginRequest, session: Session = Depends(get_session)):
     """JSON-based login. Sets secure HttpOnly cookie and returns token."""
-    user = session.exec(select(User).where(User.email == login_data.email.lower())).first()
+    user = session.exec(select(User).options(selectinload(User.team)).where(User.email == login_data.email.lower())).first()
     if not user or not verify_password(login_data.password, user.password_hash):
         logger.error(f"Login failed for user: {login_data.email}")
         raise HTTPException(
@@ -63,7 +67,9 @@ async def login(response: Response, login_data: LoginRequest, session: Session =
         # Verify the interview session token matches the candidate
         
         interview = session.exec(
-            select(InterviewSession).where(
+            select(InterviewSession)
+            .options(selectinload(InterviewSession.paper), selectinload(InterviewSession.coding_paper))
+            .where(
                 InterviewSession.access_token == login_data.access_token,
                 InterviewSession.candidate_id == user.id
             )
@@ -113,7 +119,6 @@ async def login(response: Response, login_data: LoginRequest, session: Session =
         "profile_image" : user.profile_image,
         "team": team_data
     }
-    print(token_data)
     return ApiResponse(
         status_code=200,
         data=token_data,
@@ -160,7 +165,12 @@ async def login_for_access_token(
 async def logout(response: Response):
     """Clears the authentication cookie."""
     from ..core.config import ENV
-    response.delete_cookie(key="access_token", samesite="lax", secure=(ENV == "production"))
+    is_prod = ENV == "production"
+    response.delete_cookie(
+        key="access_token", 
+        samesite="none" if is_prod else "lax", 
+        secure=is_prod
+    )
     return ApiResponse(
         status_code=200,
         data={},
@@ -180,7 +190,7 @@ async def register(
     - Subsequent users must be registered by an Admin.
     """
     # Bootstrap Check - first user can register freely
-    all_user_count = len(session.exec(select(User)).all())
+    all_user_count = session.exec(select(func.count(User.id))).one()
     
     if all_user_count > 0:
         # Require Admin Auth
@@ -201,7 +211,7 @@ async def register(
     existing_user = session.exec(select(User).where(User.email == user_data.email.lower())).first()
     if existing_user:
         logger.error(f"Registration attempt for already registered email: {user_data.email}")
-        raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
 
     hashed_password = get_password_hash(user_data.password)
 
@@ -255,6 +265,72 @@ async def register(
         status_code=201,
         data=token_data,
         message="User registered successfully"
+    )
+
+@router.post("/signup/candidate", response_model=ApiResponse[dict], status_code=201)
+async def candidate_signup(
+    response: Response, 
+    signup_data: CandidateSignupRequest, 
+    session: Session = Depends(get_session)
+):
+    """
+    Public signup for candidates.
+    - Creates a User with role=CANDIDATE.
+    - Creates an associated UserDetail entry.
+    - Automatically logs in the user and returns a token.
+    """
+    existing_user = session.exec(select(User).where(User.email == signup_data.email.lower())).first()
+    if existing_user:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+
+    hashed_password = get_password_hash(signup_data.password)
+
+    # 1. Create User
+    new_user = User(
+        email=signup_data.email.lower(),
+        full_name=signup_data.full_name,
+        password_hash=hashed_password,
+        role=UserRole.CANDIDATE
+    )
+    session.add(new_user)
+    
+    try:
+        session.flush() # Get user ID
+        
+        # 2. Create associated UserDetail
+        from ..models.db_models import UserDetail
+        new_detail = UserDetail(user_id=new_user.id)
+        session.add(new_detail)
+        
+        session.commit()
+        session.refresh(new_user)
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Candidate signup failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to register candidate")
+    
+    # 3. Auto Login
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(
+        data={"sub": new_user.email}, expires_delta=access_token_expires
+    )
+    
+    set_auth_cookie(response, token)
+    
+    token_data = {
+        "access_token": token, 
+        "token_type": "bearer",
+        "id": new_user.id,
+        "email": new_user.email,
+        "full_name": new_user.full_name,
+        "role": "CANDIDATE",
+        "expires_at": (datetime.now(timezone.utc) + access_token_expires).isoformat()
+    }
+    
+    return ApiResponse(
+        status_code=201,
+        data=token_data,
+        message="Candidate registered successfully"
     )
 
 @router.get("/me", response_model=ApiResponse[dict])

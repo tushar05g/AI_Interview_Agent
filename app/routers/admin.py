@@ -31,6 +31,7 @@ from ..schemas.admin.dashboard import GetCandidateStatusResponse, LiveStatusItem
 InterviewSessionDetail = AdminInterviewSessionDetail
 from ..schemas.shared.api_response import ApiResponse, PaginatedResponse
 from ..schemas.shared.user import UserNested, serialize_user
+from ..schemas.candidate.profile import CandidateDetailUpdate, CandidateProfileResponse, UserDetailBase
 
 
 
@@ -725,6 +726,121 @@ async def delete_question(
         message="Question deleted successfully"
     )
 
+@router.get("/candidates/{user_id}", response_model=ApiResponse[CandidateProfileResponse])
+async def admin_get_candidate_profile(
+    user_id: int,
+    current_user: Annotated[User, Depends(get_admin_user)],
+    session: Annotated[Session, Depends(get_session)]
+):
+    """Admin: Get any candidate's profile and details."""
+    user = session.get(User, user_id)
+    if not user or user.role != UserRole.CANDIDATE:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+        
+    from ..models.db_models import UserDetail
+    detail = session.exec(select(UserDetail).where(UserDetail.user_id == user.id)).first()
+    
+    response_data = CandidateProfileResponse(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=str(user.role.value) if hasattr(user.role, "value") else str(user.role),
+        details=UserDetailBase.model_validate(detail) if detail else None,
+        created_at=detail.created_at if detail else None,
+        updated_at=detail.updated_at if detail else None
+    )
+    
+    return ApiResponse(
+        status_code=200,
+        data=response_data,
+        message="Candidate profile retrieved successfully"
+    )
+
+@router.patch("/candidates/{user_id}", response_model=ApiResponse[CandidateProfileResponse])
+async def admin_update_candidate_profile(
+    user_id: int,
+    update_data: CandidateDetailUpdate,
+    current_user: Annotated[User, Depends(get_admin_user)],
+    session: Annotated[Session, Depends(get_session)]
+):
+    """Admin: Update any candidate's profile and details."""
+    user = session.get(User, user_id)
+    if not user or user.role != UserRole.CANDIDATE:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+        
+    from ..models.db_models import UserDetail
+    
+    # 1. Update User basic info
+    if update_data.full_name is not None:
+        user.full_name = update_data.full_name
+        session.add(user)
+
+    # 2. Update UserDetail
+    detail = session.exec(select(UserDetail).where(UserDetail.user_id == user.id)).first()
+    if not detail:
+        detail = UserDetail(user_id=user.id)
+        session.add(detail)
+    
+    update_dict = update_data.model_dump(exclude_unset=True)
+    if "full_name" in update_dict:
+        del update_dict["full_name"]
+        
+    for key, value in update_dict.items():
+        setattr(detail, key, value)
+    
+    detail.updated_at = datetime.utcnow()
+    session.add(detail)
+    
+    try:
+        session.commit()
+        session.refresh(user)
+        session.refresh(detail)
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Admin candidate update failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update candidate profile")
+        
+    response_data = CandidateProfileResponse(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=str(user.role.value) if hasattr(user.role, "value") else str(user.role),
+        details=UserDetailBase.model_validate(detail),
+        created_at=detail.created_at,
+        updated_at=detail.updated_at
+    )
+    
+    return ApiResponse(
+        status_code=200,
+        data=response_data,
+        message="Candidate profile updated successfully"
+    )
+
+@router.delete("/candidates/{user_id}", response_model=ApiResponse[dict])
+async def admin_delete_candidate(
+    user_id: int,
+    current_user: Annotated[User, Depends(get_admin_user)],
+    session: Annotated[Session, Depends(get_session)]
+):
+    """Admin: Delete any candidate's account."""
+    user = session.get(User, user_id)
+    if not user or user.role != UserRole.CANDIDATE:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+        
+    session.delete(user)
+    try:
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Admin candidate deletion failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete candidate account")
+        
+    return ApiResponse(
+        status_code=200,
+        data={},
+        message="Candidate account deleted successfully"
+    )
+
 @router.get("/questions", response_model=ApiResponse[PaginatedResponse[Questions]])
 async def list_all_questions(
     skip: int = 0,
@@ -1091,17 +1207,33 @@ async def list_interviews(
     query = select(InterviewSession)
     
     # 1. Date Filtering
+    def parse_date(date_str: str):
+        """Helper to handle basic ISO dates and optional padding."""
+        if not date_str:
+            return None
+        # Basic padding for cases like 2026-5-9 -> 2026-05-09
+        parts = date_str.split('T')[0].split('-')
+        if len(parts) == 3:
+            parts[1] = parts[1].zfill(2)
+            parts[2] = parts[2].zfill(2)
+            date_str = "-".join(parts) + (date_str[len("-".join(parts)):] if len(date_str) > 10 else "")
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
     if from_date:
         try:
-            start_dt = datetime.fromisoformat(from_date.replace("Z", "+00:00")).replace(hour=0, minute=0, second=0, microsecond=0)
-            query = query.where(InterviewSession.schedule_time >= start_dt)
+            dt = parse_date(from_date)
+            if dt:
+                start_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.where(InterviewSession.schedule_time >= start_dt)
         except ValueError:
             logger.warning(f"Invalid from_date format: {from_date}")
 
     if to_date:
         try:
-            end_dt = datetime.fromisoformat(to_date.replace("Z", "+00:00")).replace(hour=23, minute=59, second=59, microsecond=999999)
-            query = query.where(InterviewSession.schedule_time <= end_dt)
+            dt = parse_date(to_date)
+            if dt:
+                end_dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+                query = query.where(InterviewSession.schedule_time <= end_dt)
         except ValueError:
             logger.warning(f"Invalid to_date format: {to_date}")
     
@@ -1324,8 +1456,13 @@ async def update_interview(
             detail="Not authorized to modify this interview session"
         )
     
-    # Prevent updates to live or completed interviews (business rule)
-    if interview_session.status in [InterviewStatus.LIVE, InterviewStatus.COMPLETED]:
+    # Prevent updates to active or completed interviews (business rule)
+    if interview_session.status in [
+        InterviewStatus.CONNECTED,
+        InterviewStatus.LIVE,
+        InterviewStatus.DISCONNECTED,
+        InterviewStatus.COMPLETED
+    ]:
         raise HTTPException(
             status_code=400, 
             detail=f"Cannot update interview with status '{interview_session.status.value}'. Only scheduled interviews can be modified."
@@ -1565,6 +1702,8 @@ async def get_all_results(
     skip: int = 0,
     limit: int = 20,
     search: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
     current_user: User = Depends(get_admin_user), 
     session: Session = Depends(get_session)
 ):
@@ -1573,6 +1712,36 @@ async def get_all_results(
     from ..models.db_models import InterviewResult
     query = select(InterviewSession).join(InterviewResult)
     
+    # 1. Date Filtering (by schedule_time, consistent with /interviews)
+    def parse_date(date_str: str):
+        """Helper to handle basic ISO dates and optional padding."""
+        if not date_str:
+            return None
+        parts = date_str.split('T')[0].split('-')
+        if len(parts) == 3:
+            parts[1] = parts[1].zfill(2)
+            parts[2] = parts[2].zfill(2)
+            date_str = "-".join(parts) + (date_str[len("-".join(parts)):] if len(date_str) > 10 else "")
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+
+    if from_date:
+        try:
+            dt = parse_date(from_date)
+            if dt:
+                start_dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                query = query.where(InterviewSession.schedule_time >= start_dt)
+        except ValueError:
+            logger.warning(f"Invalid from_date format: {from_date}")
+
+    if to_date:
+        try:
+            dt = parse_date(to_date)
+            if dt:
+                end_dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+                query = query.where(InterviewSession.schedule_time <= end_dt)
+        except ValueError:
+            logger.warning(f"Invalid to_date format: {to_date}")
+
     if current_user.role != UserRole.SUPER_ADMIN:
         query = query.where(InterviewSession.admin_id == current_user.id)
         

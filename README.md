@@ -26,14 +26,12 @@ A full-stack platform for automated technical interviews, integrating computer v
 ### 🔍 Intelligent Proctoring
 - **Identity Verification** — Database-backed face recognition using **ArcFace** (DeepFace) with selfie enrollment workflow.
 - **Gaze Tracking** — Real-time monitoring of candidate eye movement via **MediaPipe** Face Landmarker.
-- **Tab Switch Detection** — Monitors and counts browser tab switches during the interview to detect potential cheating.
 - **Live Monitoring** — Admin monitoring capability via **WebRTC** (aiortc) and **WebSocket** dashboard with real-time status updates.
-- **Proctoring Events** — Timestamped audit log of violations (tab switches, gaze deviations, face absence), warnings, and severity tracking.
+- **Proctoring Events** — Timestamped audit log of violations, warnings, and severity tracking.
 
 ### 🤖 AI Interviewer
-- **Polyglot Evaluation** — Automated answer scoring using LLMs (Ollama / Modal-hosted) with asynchronous processing for millisecond latency.
+- **Polyglot Evaluation** — Automated answer scoring using LLMs (Ollama / Modal-hosted).
 - **Adaptive Q&A** — Support for **Verbal** (Audio-in/Audio-out) and **Coding** (Text-in) question types with configurable difficulty.
-- **Dynamic Timing** — Per-question and global timers with server-side control to ensure fairness and prevent tampering.
 - **Speech Pipeline** — Integrated `Faster-Whisper` for STT, `Edge-TTS` for voice synthesis, and `SpeechBrain` for speaker verification.
 - **Document-Based Question Generation** — Upload resumes, job descriptions, or Excel files to auto-generate questions via NLP.
 
@@ -107,12 +105,9 @@ All endpoints are prefixed with `/api`. Full interactive docs are available at `
 | **Admin — Results** | `GET /admin/results`, `GET /admin/result/{id}` | View & update scores, download response audio |
 | **Admin — Live** | `GET /admin/live-status`, `WS /admin/ws/dashboard` | Real-time interview monitoring dashboard |
 | **Interview** | `GET /interview/access/{token}` | Candidate validates and enters interview |
-| **Interview** | `POST /interview/start-session` | Master synchronization point for session initialization |
-| **Interview** | `POST /interview/start/{id}` | Start session with enrollment audio (Legacy) |
+| **Interview** | `POST /interview/start/{id}` | Start session with enrollment audio |
 | **Interview** | `POST /interview/selfie/{id}` | Upload reference selfie for face verification |
-| **Interview** | `POST /question/start` | Initialize a specific question timer |
-| **Interview** | `POST /question/next` | Progress to the next question in sequence |
-| **Interview** | `GET /interview/question/{id}` | Get specific question details |
+| **Interview** | `GET /interview/question/{id}` | Get next question in sequence |
 | **Interview** | `POST /interview/answer/audio`, `/text` | Submit verbal or written answers |
 | **Interview** | `POST /interview/finish/{id}` | Complete interview & trigger background evaluation |
 | **Tools** | `POST /interview/stt`, `GET /interview/tts` | Standalone Speech-to-Text & Text-to-Speech |
@@ -157,10 +152,6 @@ This launches:
 
 ### 3. Run Locally (Development)
 ```bash
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
 # Install dependencies
 pip install -r requirements.txt
 
@@ -342,5 +333,3 @@ See [docs/API_TESTING_GUIDE.md](docs/API_TESTING_GUIDE.md) for detailed API test
 ## License
 
 Proprietary & Confidential.
-#   A I _ I n t e r v i e w _ A g e n t  
- 
