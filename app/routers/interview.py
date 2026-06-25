@@ -28,7 +28,6 @@ from ..services.email import EmailService
 from ..schemas.auth.login import OtpRequest, OtpVerifyRequest
 from ..auth.security import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from ..services.interview_access import (
-    LINK_VALIDITY_MINUTES,
     evaluate_interview_access,
     has_started,
     get_timer_sync_data,
@@ -50,7 +49,7 @@ def set_auth_cookie(response: Response, token: str):
 # Initialize services for OTP
 email_service = EmailService()
 
-from pydub import AudioSegment
+
 import logging
 from ..core.logger import get_logger
 
@@ -395,6 +394,7 @@ def _serialize_interview_access_detail(session: InterviewSession) -> InterviewAc
     proctoring_event = ProctoringEvent(
         id=session.id,
         warning_count=session.warning_count or 0,
+        tab_switch_count=session.tab_switch_count or 0,
         max_warnings=session.max_warnings or 3,
         is_suspended=session.is_suspended or False,
         suspension_reason=session.suspension_reason,
@@ -514,6 +514,8 @@ def _serialize_interview_access_detail(session: InterviewSession) -> InterviewAc
         is_completed=session.is_completed or False,
         tab_switch_count=session.tab_switch_count or 0,
         tab_warning_active=session.tab_warning_active or False,
+        warning_count=session.warning_count or 0,
+        max_warnings=session.max_warnings or 3,
         allow_proctoring=getattr(session, "allow_proctoring", True),
         curr_interview_timer=curr_interview_timer,
         curr_question_timer=curr_question_timer,
@@ -576,15 +578,16 @@ def _evaluate_and_update_score(
             if question_obj:
                 resp_type = (question_obj.response_type.value if hasattr(question_obj.response_type, 'value') else str(question_obj.response_type)) if question_obj.response_type else "text"
                 q_title = question_obj.question_text or question_obj.content or question_text
-                q_marks = float(question_obj.marks or 10.0)
+                q_marks = float(question_obj.marks if question_obj.marks is not None else 10.0)
         elif getattr(answer, 'coding_question_id', None):
             question_obj = db.get(CodingQuestions, answer.coding_question_id)
             if question_obj:
                 resp_type = "code"
                 q_title = question_obj.title or question_text
-                q_marks = float(question_obj.marks or 10.0)
+                q_marks = float(question_obj.marks if question_obj.marks is not None else 10.0)
 
         # 3. Call LLM evaluation (routes to code evaluator if response_type='code')
+
         logger.info(f"Answer {answer.id}: running real-time evaluation (type={resp_type}, marks={q_marks})...")
         evaluation = interview_service.evaluate_answer_content(
             question_text, text_to_evaluate,
@@ -725,7 +728,7 @@ async def access_interview(
                 session_db.commit()
             raise HTTPException(
                 status_code=403,
-                detail=f"This interview link has expired. Candidates must join within {session.duration_minutes} minutes of the scheduled time.",
+                detail=f"This interview link has expired. Candidates must join within {LINK_VALIDITY_MINUTES} minutes of the scheduled time.",
             )
 
         if access_decision.duration_expired:
@@ -751,7 +754,7 @@ async def access_interview(
         elif access_decision.reason == "explicitly_expired":
             raise HTTPException(
                 status_code=403,
-                detail=f"This interview link has expired. Candidates must join within {session.duration_minutes} minutes of the scheduled time.",
+                detail=f"This interview link has expired. Candidates must join within {LINK_VALIDITY_MINUTES} minutes of the scheduled time.",
             )
         elif access_decision.reason == "cancelled":
             raise HTTPException(status_code=403, detail="Interview is cancelled")
@@ -775,7 +778,7 @@ async def access_interview(
             interview_session=session,
             new_status=CandidateStatus.LINK_ACCESSED
         )
-    
+
     return_msg = "Access Granted"
     schedule_time = session.schedule_time
     if schedule_time.tzinfo is None:
@@ -847,7 +850,7 @@ async def get_schedule_time(
         or access_decision.reason == "explicitly_expired"
         or access_decision.duration_expired
     ):
-        raise HTTPException(status_code=403, detail=f"This interview link has expired (Entry window: {session.duration_minutes} mins).")
+        raise HTTPException(status_code=403, detail=f"This interview link has expired (Entry window: {LINK_VALIDITY_MINUTES} mins).")
 
     elif session.status == InterviewStatus.LIVE:
         display_message = "This interview is currently in progress (attempted)."
@@ -966,7 +969,7 @@ async def start_session_logic(
                 session_db.commit()
             raise HTTPException(
                 status_code=403,
-                detail=f"This interview link has expired. Interviews must be started within {session.duration_minutes} minutes of the scheduled time.",
+                detail=f"This interview link has expired. Interviews must be started within {LINK_VALIDITY_MINUTES} minutes of the scheduled time.",
             )
 
         if access_decision.duration_expired:
@@ -1088,6 +1091,69 @@ async def start_session_logic(
         message="Session synchronized successfully"
     )
 
+@router.post("/{interview_id}/upload-captured-images", response_model=ApiResponse[dict])
+async def upload_captured_images(
+    interview_id: int,
+    images: List[UploadFile] = File(...),
+    session_db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Candidate frontend occasionally uploads captured images (e.g. from webcam/screen)
+    during the interview. Uploads them to Cloudinary and saves URLs to InterviewResult.
+    """
+    from ..models.db_models import InterviewResult
+    from ..services.cloudinary_service import CloudinaryService
+
+    session = session_db.get(InterviewSession, interview_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    # Get or create result
+    result = session_db.exec(select(InterviewResult).where(InterviewResult.interview_id == interview_id)).first()
+    if not result:
+        result = InterviewResult(interview_id=interview_id)
+        session_db.add(result)
+        session_db.commit()
+        session_db.refresh(result)
+
+    from datetime import datetime, timezone
+    
+    cloudinary_service = CloudinaryService()
+    uploaded_data = []
+    
+    # Existing captured images might be stored as a list
+    current_images = result.captured_images or []
+
+    for img in images:
+        try:
+            content = await img.read()
+            url = cloudinary_service.upload_image(content, folder="captured_images")
+            if url:
+                image_record = {
+                    "url": url,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }
+                uploaded_data.append(image_record)
+                current_images.append(image_record)
+        except Exception as e:
+            get_logger(__name__).error(f"Failed to upload captured image to Cloudinary: {e}")
+            
+    # Save back to database
+    result.captured_images = current_images
+    session_db.add(result)
+    try:
+        session_db.commit()
+    except Exception as e:
+        session_db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save image URLs to database")
+
+    return ApiResponse(
+        status_code=200,
+        data={"uploaded_images": uploaded_data, "total_images": len(current_images)},
+        message=f"Successfully uploaded {len(uploaded_data)} images"
+    )
+
 @router.post("/upload-selfie", response_model=ApiResponse[dict])
 async def upload_selfie_session(
     candidate_id: int = Form(...),
@@ -1106,6 +1172,7 @@ async def upload_selfie_session(
     import json
     import tempfile
     import os
+    # pyrefly: ignore [missing-import]
     from deepface import DeepFace
     
     _logger = get_logger(__name__)
@@ -1195,6 +1262,7 @@ async def upload_selfie_session(
         
         # 2. Local Fallback (Skip in Orchestrator mode to avoid importing DeepFace)
         if arcface_embedding is None and not IS_ORCHESTRATOR:
+            # pyrefly: ignore [missing-import]
             from deepface import DeepFace
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                 tmp.write(image_bytes)
@@ -1827,23 +1895,17 @@ async def submit_answer_audio(
             exc_info=True,
         )
 
-    # Evaluate (uses candidate_answer / transcribed_text set just above)
-    question = session_db.get(Questions, question_id)
-    q_text = ""
-    if question:
-        q_text = question.question_text or question.content or ""
-
-    # Evaluation is now handled by the separate Evaluate API to ensure millisecond response time.
+    # Evaluation is handled by the separate /evaluate-answer API.
 
     return ApiResponse(
         status_code=200,
         data={
             "status": "saved",
             "feedback": answer.feedback,
-            "score": answer.score,
+            "score": answer.score if answer.score is not None else 0.0,
             "transcribed_text": answer.transcribed_text,
         },
-        message="Audio answer submitted and evaluated successfully"
+        message="Audio answer saved successfully"
     )
 
 
@@ -1905,8 +1967,8 @@ async def submit_answer_code(
     question = session_db.get(CodingQuestions, coding_question_id)
     if not question: raise HTTPException(status_code=404, detail="Coding question not found")
 
-    # Evaluation is now handled by the separate Evaluate API.
-    
+    # Evaluation is handled by the separate /evaluate-answer API.
+
     session_db.refresh(answer)
 
     from ..schemas.interview.access import AnswerShort, CodingQuestionWithAnswer
@@ -2011,7 +2073,7 @@ async def submit_answer_text(
         session_db.commit()
         session_db.refresh(answer)
 
-        # Evaluation is now handled by the separate Evaluate API.
+        # Evaluation is handled by the separate /evaluate-answer API.
 
         from ..schemas.interview.access import AnswerShort, CodingQuestionWithAnswer
         import json as _json
@@ -2078,8 +2140,7 @@ async def submit_answer_text(
     session_db.commit()
     session_db.refresh(answer)
 
-    # Evaluation is now handled by the separate Evaluate API.
-    session_db.refresh(answer)
+    # Evaluation is handled by the separate /evaluate-answer API.
 
     from ..schemas.interview.access import AnswerShort, QuestionWithAnswer
     
@@ -2088,7 +2149,7 @@ async def submit_answer_text(
         interview_result_id=answer.interview_result_id,
         candidate_answer=answer.candidate_answer,
         feedback=answer.feedback or "",
-        score=answer.score or 0.0,
+        score=answer.score if answer.score is not None else 0.0,
         audio_path=answer.audio_path or "",
         transcribed_text=answer.transcribed_text or "",
         timestamp=answer.timestamp
@@ -2143,16 +2204,89 @@ async def finish_interview(interview_id: int, background_tasks: BackgroundTasks,
 @router.post("/evaluate-answer", response_model=ApiResponse[dict])
 async def evaluate_answer(request: AnswerRequest, session_db: Session = Depends(get_session), current_user: User = Depends(get_current_user)):
     """
-    Stateless endpoint to evaluate a candidate's answer against a question.
-    Does not save the result to any specific interview session.
+    Evaluates a candidate's answer against a question.
+
+    Automatically resolves the question's actual marks from the database by:
+    1. Using explicit question_id / coding_question_id if provided (fast path).
+    2. Falling back to question_marks field if provided directly.
+    3. Defaulting to 10 if none of the above match.
+
     """
     try:
-        evaluation = interview_service.evaluate_answer_content(request.question, request.answer)
-        
+        q_marks = 10.0  # safe default
+        resp_type = "text"
+
+        # ── Fast path: explicit IDs supplied by caller ────────────────────────
+        if request.question_id:
+            q_obj = session_db.get(Questions, request.question_id)
+            if q_obj:
+                q_marks = float(q_obj.marks if q_obj.marks is not None else 10.0)
+                resp_type = (
+                    q_obj.response_type.value
+                    if hasattr(q_obj.response_type, "value")
+                    else str(q_obj.response_type)
+                ) if q_obj.response_type else "text"
+
+        elif request.coding_question_id:
+            cq_obj = session_db.get(CodingQuestions, request.coding_question_id)
+            if cq_obj:
+                q_marks = float(cq_obj.marks if cq_obj.marks is not None else 10.0)
+                resp_type = "code"
+
+        elif request.question_marks is not None:
+            # Caller supplied marks directly
+            q_marks = float(request.question_marks)
+
+        else:
+            # ── Auto-lookup: match by question text (no frontend change needed) ──
+            q_text = request.question.strip()
+
+            # 1. Try standard Questions table (question_text or content column)
+            q_obj = session_db.exec(
+                select(Questions).where(
+                    (Questions.question_text == q_text) | (Questions.content == q_text)
+                )
+            ).first()
+            if q_obj:
+                q_marks = float(q_obj.marks if q_obj.marks is not None else 10.0)
+                resp_type = (
+                    q_obj.response_type.value
+                    if hasattr(q_obj.response_type, "value")
+                    else str(q_obj.response_type)
+                ) if q_obj.response_type else "text"
+                logger.info(
+                    f"evaluate-answer: auto-matched Questions id={q_obj.id}, marks={q_marks}"
+                )
+            else:
+                # 2. Try CodingQuestions table (problem_statement or title)
+                cq_obj = session_db.exec(
+                    select(CodingQuestions).where(
+                        (CodingQuestions.problem_statement == q_text)
+                        | (CodingQuestions.title == q_text)
+                    )
+                ).first()
+                if cq_obj:
+                    q_marks = float(cq_obj.marks if cq_obj.marks is not None else 10.0)
+                    resp_type = "code"
+                    logger.info(
+                        f"evaluate-answer: auto-matched CodingQuestions id={cq_obj.id}, marks={q_marks}"
+                    )
+                else:
+                    logger.warning(
+                        "evaluate-answer: question text not found in DB, defaulting to 10 marks."
+                    )
+
+        evaluation = interview_service.evaluate_answer_content(
+            request.question,
+            request.answer,
+            response_type=resp_type,
+            question_marks=q_marks,
+        )
+
         # Remove interview_id from response if it existed in the prompt output
         if "interview_id" in evaluation:
             del evaluation["interview_id"]
-            
+
         return ApiResponse(
             status_code=200,
             data=evaluation,
@@ -2242,51 +2376,6 @@ async def log_tab_switch(
         else:
             return_msg = "Tab switch detected. Please return to the interview tab within 30 seconds."
             
-    elif event_type == "TAB_RETURN":
-        if not session_obj.tab_warning_active or not session_obj.tab_switch_timestamp:
-            return_msg = "Tab return recorded."
-        else:
-            ts = session_obj.tab_switch_timestamp
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            elapsed = (now - ts).total_seconds()
-            
-            if elapsed > 30:
-                # Terminate
-                session_obj.is_suspended = True
-                session_obj.status = InterviewStatus.COMPLETED
-                session_obj.is_completed = True
-                session_obj.end_time = now
-                session_obj.suspension_reason = "tab_switch_timeout"
-                session_obj.suspended_at = now
-                session_obj.tab_warning_active = False
-                
-                record_status_change(
-                    session=session_db,
-                    interview_session=session_obj,
-                    new_status=CandidateStatus.SUSPENDED,
-                    metadata={"reason": "tab_switch_timeout", "elapsed_seconds": elapsed}
-                )
-                # Ensure database is committed before raising exception
-                session_db.add(session_obj)
-                session_db.commit()
-
-                from ..core.tasks import run_background_task
-                from ..tasks.interview_tasks import process_session_results_task
-                run_background_task(process_session_results_task, session_obj.id)
-
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "is_suspended": True,
-                        "reason": "tab_switch_timeout",
-                        "message": "Interview terminated due to tab-switch timeout."
-                    }
-                )
-            else:
-                # Valid return
-                session_obj.tab_warning_active = False
-                return_msg = "Tab return within time limit."
     else:
         raise HTTPException(status_code=400, detail=f"Invalid event_type: {event_type}")
 
@@ -2294,78 +2383,8 @@ async def log_tab_switch(
     session_db.commit()
     session_db.refresh(session_obj)
 
-    # Build InterviewAccessResponse for consistent response
-    # candidate_data = None
-    # if session_obj.candidate:
-    #     candidate_data = UserNested(
-    #         id=session_obj.candidate.id,
-    #         email=session_obj.candidate.email,
-    #         full_name=session_obj.candidate.full_name,
-    #         role=session_obj.candidate.role.value if hasattr(session_obj.candidate.role, 'value') else str(session_obj.candidate.role),
-    #         access_token=session_obj.candidate.access_token
-    #     )
-
-    # admin_data = None
-    # if session_obj.admin:
-    #     admin_data = UserNested(
-    #         id=session_obj.admin.id,
-    #         email=session_obj.admin.email,
-    #         full_name=session_obj.admin.full_name,
-    #         role=session_obj.admin.role.value if hasattr(session_obj.admin.role, 'value') else str(session_obj.admin.role),
-    #         access_token=session_obj.admin.access_token
-    #     )
-
-    # paper_data = None
-    # if session_obj.paper:
-    #     paper_questions = []
-    #     if hasattr(session_obj.paper, 'questions') and session_obj.paper.questions:
-    #         for q in session_obj.paper.questions:
-    #             paper_questions.append(QuestionData(
-    #                 id=q.id, paper_id=q.paper_id, content=q.content or "", question_text=q.question_text or "",
-    #                 topic=q.topic or "", difficulty=q.difficulty.value if hasattr(q.difficulty, 'value') else str(q.difficulty),
-    #                 marks=q.marks, response_type=q.response_type.value if hasattr(q.response_type, 'value') else str(q.response_type)
-    #             ))
-    #     paper_data = QuestionPaperData(
-    #         id=session_obj.paper.id,
-    #         name=session_obj.paper.name,
-    #         description=session_obj.paper.description or "",
-    #         admin_user=admin_data if admin_data else None,
-    #         question_count=len(paper_questions),
-    #         questions=paper_questions,
-    #         total_marks=session_obj.paper.total_marks,
-    #         created_at=session_obj.paper.created_at or datetime.now(timezone.utc)
-    #     )
-
-    # result_data = InterviewAccessResponse(
-    #     id=session_obj.id,
-    #     access_token=session_obj.access_token,
-    #     admin_user=serialize_user(session_obj.admin) if session_obj.admin else None,  # ← Always UserNested
-    #     candidate_user=candidate_data,
-    #     paper=paper_data,
-    #     schedule_time=session_obj.schedule_time,
-    #     duration_minutes=session_obj.duration_minutes,
-    #     max_questions=session_obj.max_questions,
-    #     start_time=session_obj.start_time,
-    #     end_time=session_obj.end_time,
-    #     status=session_obj.status.value if hasattr(session_obj.status, 'value') else str(session_obj.status),
-    #     total_score=session_obj.total_score,
-    #     current_status=session_obj.current_status.value if hasattr(session_obj.current_status, 'value') else str(session_obj.current_status),
-    #     last_activity=session_obj.last_activity or datetime.now(timezone.utc),
-    #     warning_count=session_obj.warning_count or 0,
-    #     max_warnings=session_obj.max_warnings or 3,
-    #     is_suspended=session_obj.is_suspended or False,
-    #     suspension_reason=session_obj.suspension_reason,
-    #     suspended_at=session_obj.suspended_at,
-    #     enrollment_audio_path=session_obj.enrollment_audio_path,
-    #     is_completed=session_obj.is_completed or False,
-    #     allow_copy_paste=session_obj.allow_copy_paste,
-    #     tab_switch_count=session_obj.tab_switch_count,
-    #     tab_switch_timestamp=session_obj.tab_switch_timestamp,
-    #     tab_warning_active=session_obj.tab_warning_active
-    # )
-
     return ApiResponse(
-        status_code=200 if not session_obj.is_suspended else 403,
+        status_code=200,
         data=_serialize_interview_access_detail(session_obj),
         message=return_msg
     )
@@ -2373,41 +2392,9 @@ async def log_tab_switch(
 
 def enforce_tab_timeout(db: Session, session_obj: InterviewSession) -> None:
     """
-    Checks if there is an active tab-switch warning that has exceeded 30 seconds.
-    If so, terminates the interview immediately.
+    Checks if the session is suspended and raises 403 if it is.
+    (Legacy 30-second tab switch timeout logic has been removed).
     """
-    if session_obj.tab_warning_active and session_obj.tab_switch_timestamp:
-        now = datetime.now(timezone.utc)
-        ts = session_obj.tab_switch_timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        elapsed = (now - ts).total_seconds()
-        
-        if elapsed > 30:
-            logger.warning(f"Session {session_obj.id}: Proactive termination due to tab-switch timeout ({elapsed}s)")
-            session_obj.is_suspended = True
-            session_obj.status = InterviewStatus.COMPLETED
-            session_obj.is_completed = True
-            session_obj.end_time = now
-            session_obj.suspension_reason = "tab_switch_timeout"
-            session_obj.suspended_at = now
-            session_obj.tab_warning_active = False
-            
-            # Record status change
-            record_status_change(
-                session=db,
-                interview_session=session_obj,
-                new_status=CandidateStatus.SUSPENDED,
-                metadata={"reason": "tab_switch_timeout", "proactive": True, "elapsed_seconds": elapsed}
-            )
-            db.add(session_obj)
-            db.commit()
-            db.refresh(session_obj)
-
-            from ..core.tasks import run_background_task
-            from ..tasks.interview_tasks import process_session_results_task
-            run_background_task(process_session_results_task, session_obj.id)
-            
     if session_obj.is_suspended:
         raise HTTPException(
             status_code=403, 

@@ -14,6 +14,22 @@ from huggingface_hub import InferenceClient
 
 logger = get_logger(__name__)
 
+# Single source of truth for the evaluation system prompt used across all LLM backends.
+STRICT_EVAL_SYSTEM_PROMPT = (
+    "You are a strict but fair technical interviewer evaluating a candidate's answer. "
+    "SCORING RULES: "
+    "(1) Score range: 0.0 to 10.0 ONLY — never go above 10.0. "
+    "(2) COMPLETELY WRONG answer → 0.0. Factually incorrect, irrelevant, or off-topic answers get 0. "
+    "(3) PARTIALLY CORRECT → proportional score. If the candidate covers half the key points correctly, give ~5/10. "
+    "(4) FULLY CORRECT → 10.0. A concise, accurate answer is a perfect answer. Do NOT penalize for brevity. "
+    "(5) NON-ANSWERS → 0.0. 'I don't know', off-topic, or asking a question back = 0. "
+    "(6) STRICTLY match score to quality — do NOT give charity marks for vague or wrong guesses. "
+    "FEEDBACK RULES: Address the user as 'You'/'Your'. Never say 'the candidate'. "
+    "NEVER reveal the correct answer or model answer. You may point out where the mistake is, but you MUST NOT tell them what the correct answer should be or how to correct it. "
+    "Give concise coaching feedback focused only on what they got wrong or what was missing, without providing the actual solution. "
+    "Return a valid JSON object with exactly two keys: 'feedback' (string) and 'score_out_of_10' (float 0-10). "
+    "Respond ONLY with a valid JSON object. Do not include any text or explanations outside the JSON object."
+)
 
 # Initialize Groq Client lazily via centralized ai_clients
 def get_interview_groq():
@@ -32,6 +48,7 @@ def get_modal_evaluator():
     global _modal_evaluator, _modal_lookup_error
     if _modal_evaluator is None:
         try:
+            # pyrefly: ignore [missing-import]
             import modal
             # Check for tokens to provide better error messages
             if not os.getenv("MODAL_TOKEN_ID") or not os.getenv("MODAL_TOKEN_SECRET"):
@@ -55,20 +72,42 @@ def get_modal_evaluator():
     return _modal_evaluator
 
 
-def calculate_scaled_score(llm_score: Any, question_marks: float) -> float:
-    """Scale a 0-10 LLM score to the question's marks with clamping and rounding."""
+# Marks assigned per difficulty level for AI-generated questions
+THEORY_MARKS_BY_DIFFICULTY: dict[str, int] = {"Easy": 1, "Medium": 3, "Hard": 5}
+CODING_MARKS_BY_DIFFICULTY: dict[str, int] = {"Easy": 10, "Medium": 15, "Hard": 20}
+
+
+
+def calculate_scaled_score(llm_score: Any, question_marks: float) -> int:
+    """Scale a 0-10 LLM score to the question's marks, clamped and returned as int.
+    
+    The rounding happens BEFORE the final clamp to prevent any rounding artifact
+    from pushing the score above the question's maximum marks.
+    """
+    if isinstance(llm_score, str):
+        import re
+        match = re.search(r"(\d+(?:\.\d+)?)", llm_score)
+        if match:
+            llm_score = match.group(1)
+            
     try:
         llm_score = float(llm_score)
     except (ValueError, TypeError):
         llm_score = 0.0
     
+    # Clamp LLM score to [0, 10] first (guards against hallucinated scores like 13/10)
+    llm_score = max(0.0, min(llm_score, 10.0))
+    
     scaling_factor = float(question_marks) / 10.0
     final_score = llm_score * scaling_factor
     
-    # Safeguards: Clamp to [0, marks] and round to 1 decimal place
-    final_score_float = float(final_score)
-    final_score_clamped = max(0.0, min(final_score_float, float(question_marks)))
-    return round(final_score_clamped, 1)
+    # Round first, then clamp — this prevents int(round()) from ever exceeding question_marks
+    rounded = int(round(final_score))
+    logger.info(f"rounded score is: {rounded}")
+    logger.info(f"FINAL SCORE IS : {final_score}")
+    logger.info(f"final answer: {max(0, min(rounded, int(question_marks)))}")
+    print(f"--- DEBUG --- rounded: {rounded}, final_score: {final_score}, ans: {question_marks}")
+    return max(0, min(rounded, int(question_marks)))
 
 
 def _safe_feedback_from_score(score_out_of_10: Any) -> str:
@@ -137,7 +176,12 @@ def _is_pronoun_definition(sentence_lower: str) -> bool:
 
 
 def _sanitize_feedback_no_answer_leak(feedback: str, score_out_of_10: Any, question: str) -> str:
-    """Keep dynamic feedback but remove answer-revealing statements."""
+    """Keep dynamic feedback but remove answer-revealing statements.
+
+    Additionally, ensure the feedback addresses the user directly by replacing any
+    occurrence of "The Candidate response" (case‑insensitive) with "Your response".
+    We also replace generic "the candidate" mentions with "you" where appropriate.
+    """
     if not feedback or not str(feedback).strip():
         return _safe_feedback_from_score(score_out_of_10)
 
@@ -185,9 +229,31 @@ def _sanitize_feedback_no_answer_leak(feedback: str, score_out_of_10: Any, quest
         return _safe_feedback_from_score(score_out_of_10)
 
     sanitized = " ".join(safe_sentences).strip()
+    # Replace third‑person candidate phrasing with second‑person wording
+    sanitized = re.sub(r"(?i)\bthe candidate response\b", "Your response", sanitized)
+    sanitized = re.sub(r"(?i)\bthe candidate\b", "you", sanitized)
     if len(sanitized) > 500:
         sanitized = sanitized[:500].rsplit(" ", 1)[0].rstrip(".,;: ") + "."
     return sanitized
+
+
+def _augment_feedback(parsed: dict, answer: str, question: str) -> dict:
+    """Append a gentle hint about missing key concepts without revealing solution.
+
+    The hint is added only when the extracted target term from the question is
+    not present in the user's answer (checked via `_contains_target_keyword`).
+    This keeps feedback constructive while avoiding direct answer leakage.
+    """
+    if not parsed:
+        return parsed
+    feedback = parsed.get("feedback", "")
+    target_term = _extract_target_term(question)
+    if target_term and not _contains_target_keyword(answer.lower(), target_term):
+        hint = f" You missed mentioning the key concept '{target_term}'."
+        if hint.strip() not in feedback:
+            feedback = feedback.rstrip('.') + '.' + hint
+        parsed["feedback"] = feedback
+    return parsed
 
 
 def evaluate_answer_content(
@@ -223,7 +289,11 @@ def evaluate_answer_content(
             
             data = json.loads(clean_content)
             # Normalize keys
-            feedback_raw = data.get("feedback") or data.get("reason") or ""
+            feedback_raw = str(data.get("feedback") or data.get("reason") or "").strip()
+            
+            # Clean up hallucinated prefixes/suffixes
+            feedback_raw = re.sub(r"^feedback:\s*", "", feedback_raw, flags=re.IGNORECASE)
+            feedback_raw = re.sub(r"\s*score_out_of_10:\s*\d+(\.\d+)?\s*$", "", feedback_raw, flags=re.IGNORECASE)
             score_raw = data.get("score_out_of_10")
             if score_raw is None:
                 score_raw = data.get("score", 5.0)
@@ -234,12 +304,21 @@ def evaluate_answer_content(
             
             return {
                 "feedback": safe_feedback,
-                "score": calculate_scaled_score(score_raw, question_marks)
+                "score": calculate_scaled_score(score_raw, question_marks),
+                "score_out_of_10": float(score_raw)
             }
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return None
 
+    import time
     for attempt in range(2):
+        if attempt > 0:
+            sleep_time = 2 ** attempt
+            logger.info(f"Retrying evaluation in {sleep_time} seconds (attempt {attempt + 1}/2)...")
+            time.sleep(sleep_time)
+            
         logger.info(f"Evaluation attempt {attempt + 1}/2 for question: {question[:50]}...")
         
         # 1. Try Modal if enabled
@@ -257,25 +336,18 @@ def evaluate_answer_content(
         groq_client = get_interview_groq()
         if groq_client:
             try:
-                system_instruction = (
-                    "You are an expert technical interviewer. Evaluate the answer. "
-                    "Address the user directly as 'You' and 'Your' in your feedback (e.g., 'Your answer is...'). "
-                    "Never reveal, quote, paraphrase, or hint at the correct/ideal/expected answer. "
-                    "Do not provide model answers, sample answers, exact fixes, final code, or direct solution steps. "
-                    "Provide constructive and high-level coaching feedback. Return a JSON object with "
-                    "'feedback' (string) and 'score_out_of_10' (float 0-10)."
-                )
                 completion = groq_client.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": f"Question: {question}\n\nYour Answer: {answer}"}
+                        {"role": "system", "content": STRICT_EVAL_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"Question: {question}\n\nCandidate's Answer: {answer}"}
                     ],
                     temperature=0.1,
                     response_format={"type": "json_object"},
                 )
                 parsed = _parse_llm_result(completion.choices[0].message.content)
                 if parsed:
+                    parsed = _augment_feedback(parsed, answer, question)
                     logger.info(f"✅ Groq evaluation successful on attempt {attempt + 1}")
                     return parsed
             except Exception as e:
@@ -291,14 +363,16 @@ def evaluate_answer_content(
                     response = client.chat_completion(
                         model="Qwen/Qwen2.5-7B-Instruct",
                         messages=[
-                            {"role": "system", "content": "Return JSON with 'feedback' and 'score_out_of_10' (0-10). Never reveal, quote, paraphrase, or hint at the correct answer. Do not provide model answers, exact fixes, or direct solution steps. Provide high-level coaching feedback only."},
-                            {"role": "user", "content": f"Q: {question}\nA: {answer}"}
+                            {"role": "system", "content": STRICT_EVAL_SYSTEM_PROMPT},
+                            {"role": "user", "content": f"Question: {question}\n\nCandidate's Answer: {answer}"}
                         ],
                         max_tokens=512,
                         temperature=0.1
                     )
                     parsed = _parse_llm_result(response.choices[0].message.content)
-                    if parsed: return parsed
+                    if parsed:
+                        parsed = _augment_feedback(parsed, answer, question)
+                        return parsed
                 except Exception as e:
                     logger.warning(f"HF attempt {attempt + 1} failed: {e}")
 
@@ -307,7 +381,10 @@ def evaluate_answer_content(
                 evaluation_chain = evaluation_prompt | local_llm
                 response = evaluation_chain.invoke({"question": question, "answer": answer})
                 parsed = _parse_llm_result(response.content)
-                if parsed: return parsed
+                if parsed:
+                    # Add hint about missing key concept if applicable
+                    parsed = _augment_feedback(parsed, answer, question)
+                    return parsed
             else:
                 logger.warning("Orchestrator mode: Skipping local LLM fallback.")
 
@@ -328,6 +405,28 @@ def evaluate_answer_content(
 # Code Submission Evaluation
 # ---------------------------------------------------------------------------
 
+
+def _chain_invoke_code(chain, vars_: dict) -> dict:
+    """Run a LangChain chain and parse JSON response for code evaluation."""
+    import json as _json
+    raw = chain.invoke(vars_).content.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        lines = [l for l in lines if not l.startswith("```")]
+        raw = "\n".join(lines).strip()
+    try:
+        return _json.loads(raw)
+    except _json.JSONDecodeError:
+        return {
+            "feedback": raw,
+            "score": 0.0,
+            "correctness": "unknown",
+            "time_complexity": "unknown",
+            "space_complexity": "unknown",
+            "issues": [],
+        }
+
+
 def evaluate_code_submission(
     problem_title: str,
     problem_statement: str,
@@ -335,41 +434,52 @@ def evaluate_code_submission(
     question_marks: float = 10.0,
 ) -> Dict[str, Union[str, float]]:
     """Evaluate a candidate's code submission for a coding problem.
-    
+
     Returns a dict with: feedback, score, correctness, time_complexity,
     space_complexity, issues.
     """
     import json as _json
 
     def _scale_code_result(result_dict: dict) -> dict:
-        """Helper to scale score and ensure all keys exist."""
-        score_raw = result_dict.get("score", 0.0)
-        # Assuming code LLM returns score out of 10 by default
+        """Scale score and ensure all keys exist."""
+        score_raw = result_dict.get("score")
+        if score_raw is None:
+            score_raw = result_dict.get("score_out_of_10", 0.0)
         result_dict["score"] = calculate_scaled_score(score_raw, question_marks)
+        result_dict["score_out_of_10"] = float(score_raw)
         result_dict.setdefault("correctness", "unknown")
         result_dict.setdefault("time_complexity", "unknown")
         result_dict.setdefault("space_complexity", "unknown")
         result_dict.setdefault("issues", [])
         return result_dict
 
-    def _chain_invoke(chain, vars_: dict) -> dict:
-        """Run chain and parse JSON response."""
-        raw = chain.invoke(vars_).content.strip()
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            lines = [l for l in lines if not l.startswith("```")]
-            raw = "\n".join(lines).strip()
-        try:
-            return _json.loads(raw)
-        except _json.JSONDecodeError:
-            return {
-                "feedback": raw,
-                "score": 0.0,
-                "correctness": "unknown",
-                "time_complexity": "unknown",
-                "space_complexity": "unknown",
-                "issues": [],
-            }
+    def _augment_code_feedback(parsed: dict, submitted_code: str) -> dict:
+        """Append hints about missing semicolons/line-endings to LLM feedback.
+
+        Uses a simple heuristic: statement-like lines in C/Java/JS-style
+        languages that don't end with ';' are flagged as potentially missing
+        a terminating semicolon.
+        """
+        if not parsed:
+            return parsed
+        feedback = parsed.get("feedback", "")
+        missing_semicolons = []
+        for i, ln in enumerate(submitted_code.splitlines(), start=1):
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+                continue
+            if ("(" in stripped or "=" in stripped) and not stripped.endswith(";"):
+                missing_semicolons.append(i)
+        if missing_semicolons:
+            hint = (
+                f" It looks like line(s) {', '.join(map(str, missing_semicolons))}"
+                " may be missing a terminating semicolon."
+            )
+            if hint.strip() not in feedback:
+                feedback = feedback.rstrip(".") + "." + hint
+            parsed["feedback"] = feedback
+        return parsed
+
 
     chain_vars = {
         "title": problem_title,
@@ -438,7 +548,7 @@ def evaluate_code_submission(
     if not IS_ORCHESTRATOR:
         try:
             logger.info("evaluate_code: Using local Ollama...")
-            result = _chain_invoke(code_eval_chain, chain_vars)
+            result = _chain_invoke_code(code_eval_chain, chain_vars)
             logger.info(f"evaluate_code: Ollama score={result.get('score')}")
             return _scale_code_result(result)
         except Exception as e:
@@ -646,6 +756,7 @@ def generate_questions_from_prompt(
             logger.info("generate_questions: Attempting Groq API...")
             system_instruction = (
                 "You are an expert technical interviewer. Generate interview questions in JSON format. "
+                "If the user provides multiple-choice options (A, B, C, D), you MUST preserve them verbatim inside the 'question_text'. DO NOT strip them out. "
                 "Return a JSON array of objects where each object has: "
                 "'question_text' (string), 'topic' (string), 'difficulty' (string: Easy/Medium/Hard), "
                 "'marks' (int), and 'response_type' (string: text)."

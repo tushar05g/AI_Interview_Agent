@@ -1,7 +1,7 @@
 from typing import Optional, List
 from datetime import datetime, timedelta, date
 from sqlmodel import Field, SQLModel, Relationship, Column, ForeignKey, Integer
-from sqlalchemy import LargeBinary, Text
+from sqlalchemy import LargeBinary, Text, JSON
 from sqlalchemy.orm import deferred
 from enum import Enum
 import uuid
@@ -18,10 +18,12 @@ class InterviewStatus(str, Enum):
     LIVE = "LIVE"
     DISCONNECTED = "DISCONNECTED"
     COMPLETED = "COMPLETED"
+    SUSPENDED = "SUSPENDED"
     EXPIRED = "EXPIRED"
     CANCELLED = "CANCELLED"
 
 class InterviewRound(str, Enum):
+    HR_ROUND = "HR_ROUND"
     ROUND_1 = "ROUND_1"
     ROUND_2 = "ROUND_2"
     ROUND_3 = "ROUND_3"
@@ -68,6 +70,7 @@ class User(SQLModel, table=True):
         default=None,
         sa_column=deferred(Column(Text, nullable=True))
     ) # JSON/CSV string of the ArcFace/Sface vector
+    fcm_token: Optional[str] = Field(default=None, nullable=True)
     
     # Relationships
     team_id: Optional[int] = Field(
@@ -76,6 +79,9 @@ class User(SQLModel, table=True):
     team: Optional["Team"] = Relationship(
         back_populates="users",
         sa_relationship_kwargs={"foreign_keys": "User.team_id"}
+    )
+    created_by_id: Optional[int] = Field(
+        sa_column=Column(Integer, ForeignKey("user.id", ondelete="SET NULL"), nullable=True)
     )
     question_papers: List["QuestionPaper"] = Relationship(back_populates="admin")
     detail: Optional["UserDetail"] = Relationship(
@@ -267,6 +273,8 @@ class InterviewSession(SQLModel, table=True):
     max_questions: int = Field(default=0)   # 0 = use all questions
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    paused_seconds: int = Field(default=0)
+    last_disconnected_at: Optional[datetime] = None
 
     # State
     status: InterviewStatus = Field(default=InterviewStatus.SCHEDULED)
@@ -368,6 +376,8 @@ class QuestionAttempt(SQLModel, table=True):
     question_type: str = Field(default="theory") # "theory" or "coding"
     start_time: datetime = Field(default_factory=datetime.utcnow)
     duration_seconds: int = Field(default=300)
+    paused_seconds: int = Field(default=0)
+    last_disconnected_at: Optional[datetime] = None
     status: str = Field(default="active")  # active | submitted | expired
     is_completed: bool = Field(default=False)
     submitted_at: Optional[datetime] = None
@@ -382,6 +392,7 @@ class InterviewResult(SQLModel, table=True):
     )
     result_status: str = Field(default="PENDING", title="Status: PENDING, PASS, or FAIL")
     total_score: float = Field(default=0.0)
+    captured_images: List[dict] = Field(default=[], sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     session: "InterviewSession" = Relationship(back_populates="result")

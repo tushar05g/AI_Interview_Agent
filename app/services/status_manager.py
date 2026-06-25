@@ -78,6 +78,7 @@ def get_enriched_admin_data(interview_id: int, session: Optional[Session] = None
         
         return {
             "interview_id": interview_id,
+            "session_admin_id": interview_session.admin_id,
             "interview_status": str(interview_session.status.value) if hasattr(interview_session.status, 'value') else str(interview_session.status),
             "candidate": {
                 "candidate_id": candidate.id,
@@ -85,9 +86,16 @@ def get_enriched_admin_data(interview_id: int, session: Optional[Session] = None
                 "candidate_email": candidate.email
             },
             "proctoring_events": {
+                "id": interview_session.id,
                 "tab_switch_count": interview_session.tab_switch_count,
                 "warning_count": interview_session.warning_count,
-                "max_warnings": interview_session.max_warnings
+                "max_warnings": interview_session.max_warnings,
+                "is_suspended": interview_session.is_suspended,
+                "suspension_reason": interview_session.suspension_reason,
+                "suspended_at": interview_session.suspended_at.isoformat() if interview_session.suspended_at else None,
+                "allow_copy_paste": interview_session.allow_copy_paste,
+                "allow_question_navigate": interview_session.allow_question_navigate,
+                "allow_proctoring": interview_session.allow_proctoring
             },
             "dashboard_data": _get_metrics(session)
         }
@@ -106,211 +114,132 @@ def get_enriched_admin_data(interview_id: int, session: Optional[Session] = None
 
 async def _broadcast_violation_event(interview_id: int, event_type: str, details: Optional[str] = None):
     """
-    Broadcast a violation event to both candidate and admin dashboard WebSockets.
-    
-    For candidates: Sends ViolationEvent immediately with warning counts
-    For admin: Sends ViolationEvent with metadata
+    Broadcast a Proctoring_violation event to the global admin dashboard.
+    No candidate-facing broadcast per spec.
     """
     try:
         from .websocket_manager import manager
-        from ..schemas.websocket.events import ViolationEvent
-        
-        # Broadcast to admin dashboard (include enriched data)
-        # We do this first to get the most recent warning_count if needed
-        enriched_data = get_enriched_admin_data(interview_id)
-        
-        # Extract counts from enriched data for the candidate payload
-        warning_count = enriched_data.get("proctoring_events", {}).get("warning_count", 0)
-        max_warnings = enriched_data.get("proctoring_events", {}).get("max_warnings", 3)
 
-        # Map event_type to violation_type expected by ViolationEvent
-        violation_type_map = {
-            "tab_switch": "tab_switch",
-            "MULTIPLE FACES DETECTED": "multiple_faces",
-            "NO FACE DETECTED": "no_face",
-            "SECURITY ALERT: UNAUTHORIZED PERSON": "wrong_candidate",
-        }
-        
-        violation_type = violation_type_map.get(event_type, event_type.lower())
-        
-        # Create violation event for candidate
-        violation_event = ViolationEvent(
-            violation_type=violation_type,
-            interview_id=interview_id,
-            timestamp=datetime.now(timezone.utc),
-            details=details,
-            warning_count=warning_count,
-            max_warnings=max_warnings
-        )
-        
-        # Broadcast to candidate
-        await manager.broadcast_to_candidate(
-            interview_id,
-            violation_event.model_dump(mode='json')
-        )
-        
+        enriched_data = get_enriched_admin_data(interview_id)
+
         admin_payload = {
-            "event_type": "violation_detected",
+            "event_type": "Proctoring_violation",
             "data": {
                 **enriched_data,
-                "violation_type": violation_event.violation_type,
-                "details": violation_event.details,
-                "timestamp": violation_event.timestamp.isoformat()
+                "violation_type": event_type,
+                "details": details,
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
-
-        # Broadcast to per-interview admin dashboards
-        await manager.broadcast_to_admin_dashboard(
-            interview_id,
-            admin_payload
-        )
-        
-        # Broadcast to global admin dashboards
         await manager.broadcast_to_admins(admin_payload)
-        
-        logger.debug(f"Violation event broadcast: {event_type} for interview {interview_id}")
-        
+        logger.debug(f"Proctoring_violation broadcast for interview {interview_id}, type={event_type}")
+
     except Exception as e:
         logger.error(f"Failed to broadcast violation event: {e}")
 
 
 async def _broadcast_interview_suspended_event(interview_id: int, violation_type: str, tab_switch_count: int):
     """
-    Broadcast interview suspension event to admin dashboard.
-    Sent when violation threshold is exceeded.
+    Broadcast Interview_suspended event to the global admin dashboard.
+    No candidate-facing broadcast per spec.
     """
     try:
         from .websocket_manager import manager
-        from ..schemas.websocket.events import AdminDashboardEvent
-        
-        # Create suspension event payload and include enriched data
-        enriched_data = get_enriched_admin_data(interview_id)
 
-        suspension_payload = {
-            "event_type": "interview_suspended",
+        enriched_data = get_enriched_admin_data(interview_id)
+        proctoring_data = enriched_data.get("proctoring_events", {})
+        warning_count = proctoring_data.get("warning_count", tab_switch_count)
+        max_warnings  = proctoring_data.get("max_warnings", tab_switch_count)
+
+        admin_payload = {
+            "event_type": "Interview_suspended",
             "data": {
                 **enriched_data,
                 "reason": "max_warnings_exceeded",
-                "warning_count": tab_switch_count,
-                "max_warnings": tab_switch_count,
+                "warning_count": warning_count,
+                "max_warnings": max_warnings,
+                "is_suspended": True,
                 "last_violation": violation_type,
                 "suspension_metadata": {
                     "auto_suspended": True,
                     "suspended_at": datetime.now(timezone.utc).isoformat()
-                }
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 
-        # Broadcast to per-interview admin dashboards
-        await manager.broadcast_to_admin_dashboard(
-            interview_id,
-            suspension_payload
-        )
-        
-        # Broadcast to global admin dashboards
-        await manager.broadcast_to_admins(suspension_payload)
-        
-        logger.info(f"Interview suspension event broadcast for interview {interview_id}")
-        
+        await manager.broadcast_to_admins(admin_payload)
+        logger.info(f"Interview_suspended broadcast for interview {interview_id}")
+
     except Exception as e:
-        logger.error(f"Failed to broadcast interview suspended event: {e}")
+        logger.error(f"Failed to broadcast Interview_suspended event: {e}")
 
 
 async def _broadcast_interview_started_event(interview_id: int):
-    """Broadcast interview started event to admin dashboard."""
+    """Broadcast Interview_started event to global admin dashboard."""
     try:
         from .websocket_manager import manager
-        from ..schemas.websocket.events import AdminDashboardEvent
         
-        # Create enriched payload
         enriched_data = get_enriched_admin_data(interview_id)
 
         payload = {
-            "event_type": "interview_started",
+            "event_type": "Interview_started",
             "data": {
                 **enriched_data,
-                "started_at": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 
-        # Broadcast to per-interview admin dashboards
-        await manager.broadcast_to_admin_dashboard(
-            interview_id,
-            payload
-        )
-        
-        # Broadcast to global admin dashboards
         await manager.broadcast_to_admins(payload)
-        
-        logger.debug(f"Interview started event broadcast for interview {interview_id}")
+        logger.debug(f"Interview_started broadcast for interview {interview_id}")
         
     except Exception as e:
-        logger.error(f"Failed to broadcast interview started event: {e}")
+        logger.error(f"Failed to broadcast Interview_started event: {e}")
 
 
 async def _broadcast_interview_completed_event(interview_id: int, result_status: str):
-    """Broadcast interview completed event to admin dashboard."""
+    """Broadcast Interview_finished event to global admin dashboard."""
     try:
         from .websocket_manager import manager
-        from ..schemas.websocket.events import AdminDashboardEvent
         
-        # Create enriched payload
         enriched_data = get_enriched_admin_data(interview_id)
 
         payload = {
-            "event_type": "interview_completed",
+            "event_type": "Interview_finished",
             "data": {
                 **enriched_data,
                 "result_status": result_status,
-                "completed_at": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 
-        # Broadcast to per-interview admin dashboards
-        await manager.broadcast_to_admin_dashboard(
-            interview_id,
-            payload
-        )
-        
-        # Broadcast to global admin dashboards
         await manager.broadcast_to_admins(payload)
-        
-        logger.debug(f"Interview completed event broadcast for interview {interview_id}")
+        logger.debug(f"Interview_finished broadcast for interview {interview_id}")
         
     except Exception as e:
-        logger.error(f"Failed to broadcast interview completed event: {e}")
+        logger.error(f"Failed to broadcast Interview_finished event: {e}")
 
 
 async def _broadcast_interview_expired_event(interview_id: int):
-    """Broadcast interview expired event to admin dashboard."""
+    """Broadcast interview expired event to global admin dashboard."""
     try:
         from .websocket_manager import manager
-        from ..schemas.websocket.events import AdminDashboardEvent
         
-        # Create enriched payload
         enriched_data = get_enriched_admin_data(interview_id)
 
         payload = {
-            "event_type": "interview_expired",
+            "event_type": "Interview_expired",
             "data": {
                 **enriched_data,
-                "expired_at": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(timezone.utc).isoformat()
             }
         }
 
-        # Broadcast to per-interview admin dashboards
-        await manager.broadcast_to_admin_dashboard(
-            interview_id,
-            payload
-        )
-        
-        # Broadcast to global admin dashboards
         await manager.broadcast_to_admins(payload)
-        
-        logger.debug(f"Interview expired event broadcast for interview {interview_id}")
+        logger.debug(f"Interview_expired broadcast for interview {interview_id}")
         
     except Exception as e:
-        logger.error(f"Failed to broadcast interview expired event: {e}")
+        logger.error(f"Failed to broadcast Interview_expired event: {e}")
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 def set_main_loop(loop: asyncio.AbstractEventLoop):
@@ -335,7 +264,14 @@ def _fire_async_broadcast(coro):
             loop = _main_loop
             
         if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(coro, loop)
+            try:
+                current_loop = asyncio.get_running_loop()
+                if current_loop is loop:
+                    loop.create_task(coro)
+                else:
+                    asyncio.run_coroutine_threadsafe(coro, loop)
+            except RuntimeError:
+                asyncio.run_coroutine_threadsafe(coro, loop)
         else:
             # Fallback for synchronous scripts or if loop is not yet running
             try:
@@ -345,20 +281,51 @@ def _fire_async_broadcast(coro):
     except Exception as e:
         logger.error(f"Failed to fire async broadcast: {e}")
 
+# ---------------------------------------------------------------------------
 # Violation severity mapping
+#
+# Only "tab_switch" carries "warning" severity — it is the SOLE trigger for
+# the warning counter and automatic interview suspension.
+#
+# All face / gaze / proctoring violations are "info": they are recorded in
+# the DB and shown as alert messages to the candidate, but they will NEVER
+# increment the warning counter or cause suspension.
+# ---------------------------------------------------------------------------
 VIOLATION_SEVERITY = {
-    # Soft violations - accumulate warnings
-    "gaze_away": "warning",
-    "brief_disconnect": "warning",
-    "low_audio": "info",
-    "connection_unstable": "info",
-    
-    # Hard violations - accumulate warnings
-    "MULTIPLE FACES DETECTED": "warning",
-    "NO FACE DETECTED": "info",
+    # ── Tab switch ────────────────────────────────────────────────────────
+    # Only violation that accumulates warnings and can suspend the interview.
     "tab_switch": "warning",
+
+    # ── Face & gaze violations ────────────────────────────────────────────
+    # Recorded + alerted to candidate, but never cause suspension.
+    "gaze_away":                           "info",
+    "MULTIPLE FACES DETECTED":             "info",
+    "NO FACE DETECTED":                    "info",
     "SECURITY ALERT: UNAUTHORIZED PERSON": "info",
+
+    # ── Connection / device issues ────────────────────────────────────────
+    "brief_disconnect":    "info",
+    "low_audio":           "info",
+    "connection_unstable": "info",
     "unauthorized_device": "info",
+}
+
+# ---------------------------------------------------------------------------
+# Human-readable messages sent to the candidate for each violation type.
+# Used as the canonical `details` string in ViolationEvent payloads.
+# Handlers may override these with context-specific messages
+# (e.g. tab-switch messages include the current count / remaining warnings).
+# ---------------------------------------------------------------------------
+VIOLATION_CANDIDATE_MESSAGES = {
+    "tab_switch":                           "Tab switch detected. Stay on the interview page.",
+    "NO FACE DETECTED":                     "No face detected. Please stay visible in front of the camera.",
+    "MULTIPLE FACES DETECTED":              "Multiple faces detected. Only the candidate should be in view.",
+    "gaze_away":                            "Looking away from the screen detected. Please keep your eyes on the interview screen.",
+    "SECURITY ALERT: UNAUTHORIZED PERSON":  "Unrecognized face detected. Ensure you are the registered candidate.",
+    "brief_disconnect":                     "Brief connection interruption detected.",
+    "connection_unstable":                  "Unstable connection detected. Please check your internet.",
+    "low_audio":                            "Low audio level detected. Please check your microphone.",
+    "unauthorized_device":                  "Unauthorized device usage detected.",
 }
 
 
@@ -460,7 +427,7 @@ def add_violation(
     if severity == "critical":
         event.triggered_warning = True
         interview_session.is_suspended = True
-        interview_session.status = InterviewStatus.COMPLETED
+        interview_session.status = InterviewStatus.SUSPENDED
         interview_session.is_completed = True
         interview_session.end_time = datetime.now(timezone.utc)
         interview_session.suspension_reason = f"Critical violation: {event_type}"
@@ -494,39 +461,44 @@ def add_violation(
         
         logger.info(
             f"Warning added to session {interview_session.id}. "
-            f"Count: {interview_session.warning_count}/{interview_session.max_warnings}"
+            f"Count: {interview_session.warning_count}"
         )
         
-        # Check if warnings exceeded
-        if interview_session.warning_count >= interview_session.max_warnings:
-            interview_session.is_suspended = True
-            interview_session.status = InterviewStatus.COMPLETED
-            interview_session.is_completed = True
-            interview_session.end_time = datetime.now(timezone.utc)
-            interview_session.suspension_reason = f"Exceeded maximum warnings ({interview_session.max_warnings})"
-            interview_session.suspended_at = datetime.now(timezone.utc)
-            
-            # Record status change to SUSPENDED
-            record_status_change(
-                session=session,
-                interview_session=interview_session,
-                new_status=CandidateStatus.SUSPENDED,
-                metadata={
-                    "reason": "max_warnings_exceeded",
-                    "warning_count": interview_session.warning_count,
-                    "last_violation": event_type
-                }
+        # Check if tab switches exceeded limit (ONLY for tab_switch events)
+        if event_type == "tab_switch":
+            logger.info(
+                f"Tab switch warning added to session {interview_session.id}. "
+                f"Tab Switch Count: {interview_session.tab_switch_count}/{interview_session.max_warnings}"
             )
-            
-            logger.warning(
-                f"Session {interview_session.id} AUTO-SUSPENDED: "
-                f"Exceeded {interview_session.max_warnings} warnings"
-            )
-            
-            # Trigger result calculation for the suspended session
-            from ..core.tasks import run_background_task
-            from ..tasks.interview_tasks import process_session_results_task
-            run_background_task(process_session_results_task, interview_session.id)
+            if interview_session.tab_switch_count >= interview_session.max_warnings:
+                interview_session.is_suspended = True
+                interview_session.status = InterviewStatus.SUSPENDED
+                interview_session.is_completed = True
+                interview_session.end_time = datetime.now(timezone.utc)
+                interview_session.suspension_reason = f"Exceeded maximum tab switches ({interview_session.max_warnings})"
+                interview_session.suspended_at = datetime.now(timezone.utc)
+                
+                # Record status change to SUSPENDED
+                record_status_change(
+                    session=session,
+                    interview_session=interview_session,
+                    new_status=CandidateStatus.SUSPENDED,
+                    metadata={
+                        "reason": "max_warnings_exceeded",
+                        "tab_switch_count": interview_session.tab_switch_count,
+                        "last_violation": event_type
+                    }
+                )
+                
+                logger.warning(
+                    f"Session {interview_session.id} AUTO-SUSPENDED: "
+                    f"Exceeded {interview_session.max_warnings} tab switches"
+                )
+                
+                # Trigger result calculation for the suspended session
+                from ..core.tasks import run_background_task
+                from ..tasks.interview_tasks import process_session_results_task
+                run_background_task(process_session_results_task, interview_session.id)
     
     session.add(event)
     session.add(interview_session)
@@ -548,7 +520,7 @@ def add_violation(
             _broadcast_interview_suspended_event(
                 interview_session.id,
                 event_type,
-                interview_session.warning_count
+                interview_session.tab_switch_count
             )
         )
     
@@ -620,7 +592,7 @@ def check_and_suspend(
         return False
     
     interview_session.is_suspended = True
-    interview_session.status = InterviewStatus.COMPLETED
+    interview_session.status = InterviewStatus.SUSPENDED
     interview_session.is_completed = True
     interview_session.end_time = datetime.now(timezone.utc)
     interview_session.suspension_reason = reason
@@ -743,22 +715,15 @@ def compute_dashboard_metrics(target_date: Optional[date] = None) -> Dict[str, A
                     InterviewSession.start_time < end
                 )
             ).all()
-            interviews_today_count = len(interviews_today)
 
-            # distinct interviews with violations today (only for interviews started today)
-            today_interview_ids = [i.id for i in interviews_today]
-            if today_interview_ids:
-                violation_rows = session.exec(
-                    select(distinct(ProctoringEvent.interview_id)).where(
-                        ProctoringEvent.timestamp >= start,
-                        ProctoringEvent.timestamp < end,
-                        ProctoringEvent.interview_id.in_(today_interview_ids)
-                    )
-                ).all()
-                violation_interview_ids = {r[0] if isinstance(r, tuple) else r for r in violation_rows}
-                violations_today_count = len(violation_interview_ids)
-            else:
-                violations_today_count = 0
+            # distinct interviews with violations today (tab switch > 1)
+            proctoring_enabled_interviews = [
+                i for i in interviews_today if i.allow_proctoring
+            ]
+            proctoring_enabled_count = len(proctoring_enabled_interviews)
+            violations_today_count = sum(
+                1 for i in proctoring_enabled_interviews if i.tab_switch_count > 1
+            )
 
             # results completed today
             results_today = session.exec(
@@ -777,14 +742,15 @@ def compute_dashboard_metrics(target_date: Optional[date] = None) -> Dict[str, A
                     failed += 1
 
             # proctoring activity percentage
-            if interviews_today_count > 0:
-                pct = (violations_today_count / float(interviews_today_count)) * 100.0
+            if proctoring_enabled_count > 0:
+                pct = (violations_today_count / float(proctoring_enabled_count)) * 100.0
             else:
                 pct = 0.0
 
             proctoring_activity = f"{pct:.2f}%"
 
             return {
+                "today_total_interviews": len(interviews_today),
                 "live": live_count,
                 "proctoring_activity": proctoring_activity,
                 "failed_today": failed,

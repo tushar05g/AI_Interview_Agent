@@ -4,9 +4,10 @@ from ..services import interview as interview_service
 from ..models.db_models import InterviewSession, InterviewResult, Answers, Questions, CandidateStatus, User, CodingAnswers, CodingQuestions, InterviewStatus
 from ..services.email import EmailService
 from ..services.interview_access import evaluate_interview_access
+from ..services.firebase import FirebaseNotificationService
 from ..core.database import engine
 from ..core.logger import get_logger
-from ..core.config import LINK_VALIDITY_MINUTES
+from ..core.config import LINK_VALIDITY_MINUTES, FRONTEND_URL
 from ..services.status_manager import complete_interview_session
 from ..utils import format_iso_datetime, calculate_total_score, calculate_total_marks
 from sqlmodel import Session, select
@@ -68,14 +69,14 @@ def _process_answer_evaluation(db: Session, resp: Answers):
             q_text = q.question_text or q.content or "General Question"
             resp_type = q.response_type
             q_title = q.question_text or q.content or ""
-            q_marks = float(q.marks or 10.0)
+            q_marks = float(q.marks if q.marks is not None else 10.0)
     elif resp.coding_question_id:
         cq = db.get(CodingQuestions, resp.coding_question_id)
         if cq:
             q_text = cq.problem_statement or cq.title or "Coding Problem"
             resp_type = "code"
             q_title = cq.title or ""
-            q_marks = float(cq.marks or 10.0)
+            q_marks = float(cq.marks if cq.marks is not None else 10.0)
 
     logger.info(f"  Answer {resp.id}: evaluating (type={resp_type}, marks={q_marks})...")
     evaluation = interview_service.evaluate_answer_content(
@@ -178,9 +179,69 @@ def send_result_email_util(db: Session, session: InterviewSession, result_obj: I
         logger.error(f"Failed to send result email for session {session.id}: {email_err}")
 
 
+def send_result_push_notification(db: Session, session: InterviewSession):
+    """
+    Sends a Firebase push notification to the admin when an interview result is ready.
+    Notification format:
+      Title: "Interview is completed for candidate <candidate-name>."
+      Body:  "Your result is calculated successfully.\nclick to view result - <FRONTEND_URL>/result/{interview_id}"
+    """
+    try:
+        # Fetch the admin who owns this interview session
+        admin_user = db.get(User, session.admin_id)
+        if not admin_user:
+            logger.warning(f"No admin found for session {session.id}, skipping push notification.")
+            return
+
+        admin_fcm_token = admin_user.fcm_token
+        if not admin_fcm_token:
+            logger.info(
+                f"Admin (id={session.admin_id}) has no FCM token stored. "
+                "Push notification skipped."
+            )
+            return
+
+        # Resolve candidate name
+        candidate_user = db.get(User, session.candidate_id)
+        candidate_name = candidate_user.full_name if candidate_user else "Candidate"
+
+        # Build notification payload
+        result_url = f"{FRONTEND_URL.rstrip('/')}/result/{session.id}"
+        title = f"{candidate_name}'s interview completed"
+        body = "Your result is calculated successfully."
+        data = {
+            "screen": "result",
+            "interview_id": str(session.id),
+            "result_url": result_url,
+        }
+
+        success = FirebaseNotificationService.send_push_notification(
+            token=admin_fcm_token,
+            title=title,
+            body=body,
+            data=data,
+        )
+        
+        
+        if success:
+            logger.info(
+                f"Push notification sent to admin (id={session.admin_id}) "
+                f"for completed interview {session.id}."
+            )
+        else:
+            logger.warning(
+                f"Push notification failed for admin (id={session.admin_id}), "
+                f"interview {session.id}."
+            )
+    except Exception as notif_err:
+        logger.error(
+            f"Failed to send push notification for session {session.id}: {notif_err}"
+        )
+
+
 def process_session_results(interview_id: int, db: Session = None):
     """
-    Plain function: handles heavy AI processing (Whisper, LLM) after an interview finishes.
+    Synchronous fallback or direct invocation wrapper for testing.
     """
     close_db = False
     if db is None:
@@ -207,8 +268,8 @@ def process_session_results(interview_id: int, db: Session = None):
             _process_answer_evaluation(db, resp)
             db.commit()
 
-        score, total, theory, coding = _calculate_and_save_final_results(db, session, result_obj)
-        # _send_result_email(db, session, result_obj, score, total, len(theory), len(coding))  # Auto-send disabled by USER
+        _calculate_and_save_final_results(db, session, result_obj)
+        send_result_push_notification(db, session)
 
     except Exception as e:
         logger.error(f"Session {interview_id} processing failed: {e}", exc_info=True)
@@ -217,11 +278,69 @@ def process_session_results(interview_id: int, db: Session = None):
         if close_db:
             db.close()
 
+@celery_app.task(name="app.tasks.interview_tasks.process_single_answer_task")
+def process_single_answer_task(answer_id: int, interview_id: int):
+    """Process a single answer. Runs asynchronously in parallel."""
+    with Session(engine) as db:
+        resp = db.get(Answers, answer_id)
+        if not resp:
+            return
+        session_obj = db.get(InterviewSession, interview_id)
+        _process_answer_transcription(resp, session_obj)
+        _process_answer_evaluation(db, resp)
+        db.commit()
+    return answer_id
+
+@celery_app.task(name="app.tasks.interview_tasks.finalize_session_results_task")
+def finalize_session_results_task(results, interview_id: int):
+    """Callback after all answers are processed."""
+    logger.info(f"--- FINALIZING SESSION {interview_id} ---")
+    with Session(engine) as db:
+        session_obj = db.exec(
+            select(InterviewSession)
+            .where(InterviewSession.id == interview_id)
+            .options(selectinload(InterviewSession.paper), selectinload(InterviewSession.coding_paper))
+        ).first()
+        
+        if not session_obj:
+            return
+            
+        result_obj = _get_or_create_result_obj(db, interview_id)
+        _calculate_and_save_final_results(db, session_obj, result_obj)
+        send_result_push_notification(db, session_obj)
 
 @celery_app.task(name="app.tasks.interview_tasks.process_session_results_task")
 def process_session_results_task(interview_id: int):
-    """Celery wrapper."""
-    process_session_results(interview_id)
+    """Celery wrapper utilizing Chords for parallel processing, or synchronous loop if Celery is disabled."""
+    from celery import chord
+    import os
+    from ..core.config import IS_ORCHESTRATOR
+    
+    use_celery = not IS_ORCHESTRATOR and os.getenv("DISABLE_CELERY", "false").lower() == "false"
+    
+    with Session(engine) as db:
+        result_obj = _get_or_create_result_obj(db, interview_id)
+        answers = db.exec(select(Answers).where(Answers.interview_result_id == result_obj.id)).all()
+        answer_ids = [a.id for a in answers]
+        
+    if not answer_ids:
+        if use_celery:
+            finalize_session_results_task.delay([], interview_id)
+        else:
+            finalize_session_results_task([], interview_id)
+        return
+        
+    if use_celery:
+        logger.info(f"Spawning {len(answer_ids)} parallel evaluation tasks for Session {interview_id}")
+        tasks = [process_single_answer_task.s(aid, interview_id) for aid in answer_ids]
+        chord(tasks)(finalize_session_results_task.s(interview_id))
+    else:
+        logger.info(f"Celery disabled: Executing {len(answer_ids)} evaluation tasks synchronously for Session {interview_id}")
+        results = []
+        for aid in answer_ids:
+            res = process_single_answer_task(aid, interview_id)
+            results.append(res)
+        finalize_session_results_task(results, interview_id)
 
 
 def _expire_session(db: Session, session_obj: InterviewSession):
